@@ -20,6 +20,7 @@ try:
     from torch_memory_saver import (  # pyrefly: ignore[import-error]
         torch_memory_saver,
     )
+
     torch_memory_saver.hook_mode = "torch"
 
     HAVE_TORCH_MEMORY_SAVER = True
