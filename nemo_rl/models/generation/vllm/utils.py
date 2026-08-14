@@ -23,6 +23,18 @@ from nemo_rl.models.generation.interfaces import (
     ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL,
     GenerationDatumSpec,
 )
+from nemo_rl.models.generation.vllm.video_utils import (
+    build_cached_video_frame_data_url as build_cached_video_frame_data_url,
+)
+from nemo_rl.models.generation.vllm.video_utils import (
+    load_video_frames as load_video_frames,
+)
+from nemo_rl.models.generation.vllm.video_utils import (
+    load_video_frames_with_metadata as load_video_frames_with_metadata,
+)
+from nemo_rl.models.generation.vllm.video_utils import (
+    register_torchcodec_vllm_video_loader as register_torchcodec_vllm_video_loader,
+)
 from nemo_rl.utils.routed_experts_codec import encode_routed_experts
 
 R3_MISSING_ROUTE_SENTINEL = ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL

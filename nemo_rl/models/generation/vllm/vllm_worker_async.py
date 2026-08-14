@@ -43,12 +43,16 @@ from nemo_rl.models.generation.interfaces import (
 from nemo_rl.models.generation.vllm.checkpoint_engine import (
     VllmAsyncCheckpointEngineRpcMixin,
 )
+from nemo_rl.models.generation.vllm.config import should_reset_mm_cache_after_refit
 from nemo_rl.models.generation.vllm.utils import (
     attach_routed_experts_to_chat_response_choices,
     attach_token_information_to_chat_response_choices,
     format_prompt_for_vllm_generation,
     model_dump_chat_response_with_dynamic_message_fields,
     pad_and_align_routed_expert_indices,
+)
+from nemo_rl.models.generation.vllm.video_utils import (
+    register_torchcodec_vllm_video_loader,
 )
 from nemo_rl.models.generation.vllm.vllm_worker import BaseVllmGenerationWorker
 from nemo_rl.models.generation.openai_server_utils import (
@@ -163,6 +167,8 @@ class VllmAsyncGenerationWorkerImpl(
         self._load_model(self._deferred_bundle_indices, self._deferred_seed)
 
     def _create_engine(self, llm_kwargs: dict[str, Any]) -> None:
+        register_torchcodec_vllm_video_loader()
+
         from vllm.config import CompilationConfig
         from vllm.engine.arg_utils import AsyncEngineArgs
         from vllm.v1.engine.async_llm import AsyncLLM
@@ -1407,6 +1413,20 @@ class VllmAsyncGenerationWorkerImpl(
         """Async version of prepare_refit_info."""
         await self.llm.collective_rpc("prepare_refit_info", args=(state_dict_info,))
 
+    async def _reset_multimodal_caches(self) -> None:
+        """Reset engine-level multimodal and encoder caches while idle."""
+        if self.llm is None:
+            return
+        if hasattr(self.llm, "reset_mm_cache"):
+            await self.llm.reset_mm_cache()
+        if hasattr(self.llm, "reset_encoder_cache"):
+            await self.llm.reset_encoder_cache()
+
+    async def _invalidate_mm_cache_after_refit(self) -> None:
+        """Invalidate weight-dependent multimodal caches after a refit."""
+        if should_reset_mm_cache_after_refit(self.cfg):
+            await self._reset_multimodal_caches()
+
     async def update_weights_via_ipc_zmq_async(
         self,
     ) -> bool:
@@ -1423,7 +1443,8 @@ class VllmAsyncGenerationWorkerImpl(
 
             # TODO: switch to update_weights_from_local_ipc_handles for better performance once collectively report_device_id is supported in asyncLLM initialization
             result_or_coro = await self.llm.collective_rpc(
-                "update_weights_via_ipc_zmq", args=tuple()
+                "update_weights_via_ipc_zmq",
+                args=(should_reset_mm_cache_after_refit(self.cfg),),
             )
 
             if asyncio.iscoroutine(result_or_coro):
@@ -1438,6 +1459,7 @@ class VllmAsyncGenerationWorkerImpl(
                     f"Error: Worker failed to update weights. Results: {worker_results}"
                 )
                 return False
+            await self._invalidate_mm_cache_after_refit()
             return True
         except Exception as e:
             print(f"Exception during collective_rpc for weight update: {e}")
@@ -1459,7 +1481,8 @@ class VllmAsyncGenerationWorkerImpl(
                 )
 
             result_or_coro = await self.llm.collective_rpc(
-                "update_weights_from_collective", args=tuple()
+                "update_weights_from_collective",
+                args=(should_reset_mm_cache_after_refit(self.cfg),),
             )
 
             if asyncio.iscoroutine(result_or_coro):
@@ -1474,6 +1497,7 @@ class VllmAsyncGenerationWorkerImpl(
                     f"Error: Worker failed to update weights. Results: {worker_results}"
                 )
                 return False
+            await self._invalidate_mm_cache_after_refit()
             return True
         except Exception as e:
             print(f"Exception during collective_rpc for weight update: {e}")
@@ -1518,7 +1542,8 @@ class VllmAsyncGenerationWorkerImpl(
             )
 
             result_or_coro = await self.llm.collective_rpc(
-                "nccl_reshard_refit", args=tuple()
+                "nccl_reshard_refit",
+                args=(should_reset_mm_cache_after_refit(self.cfg),),
             )
 
             if asyncio.iscoroutine(result_or_coro):
@@ -1526,13 +1551,15 @@ class VllmAsyncGenerationWorkerImpl(
             else:
                 worker_results = result_or_coro
 
-            worker_result = worker_results[0]
+            worker_results = cast(list[bool], worker_results)
 
-            if not worker_result:
+            if not worker_results or not all(worker_results):
                 print(
-                    f"Error: Worker failed nccl_reshard_refit. Result: {worker_result}"
+                    "Error: Worker failed nccl_reshard_refit. "
+                    f"Results: {worker_results}"
                 )
                 return False
+            await self._invalidate_mm_cache_after_refit()
             return True
         except Exception as e:
             print(f"Exception during nccl_reshard_refit: {e}", flush=True)
@@ -1553,6 +1580,7 @@ class VllmAsyncGenerationWorkerImpl(
             )
 
         await self.llm.reset_prefix_cache()
+        await self._invalidate_mm_cache_after_refit()
         gc.collect()
         torch.cuda.empty_cache()
 

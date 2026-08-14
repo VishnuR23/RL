@@ -33,6 +33,7 @@ from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.experience.interfaces import (
+    ASYNC_ROLLOUT_EPOCHS_COMPLETED_KEY,
     NEMO_GYM_TASK_INDEX_KEY,
     NEXT_NEMO_GYM_TASK_INDEX_KEY,
 )
@@ -42,6 +43,7 @@ from nemo_rl.experience.rollouts import (
     run_async_multi_turn_rollout_groups,
 )
 from nemo_rl.models.generation.interfaces import GenerationConfig, GenerationInterface
+from nemo_rl.models.generation.vllm.config import should_reset_mm_cache_after_refit
 from nemo_rl.utils.logger import should_log_nemo_gym_full_result_tables
 from nemo_rl.utils.multimodal_payload_metrics import (
     collect_multimodal_payload_metrics,
@@ -72,6 +74,7 @@ class AsyncTrajectoryCollector:
         alias_to_group_alias: Optional[dict[str, str]] = None,
         on_policy_distillation_cfg: Optional[dict[str, Any]] = None,
         next_nemo_gym_task_index: int = 0,
+        epochs_completed: int = 0,
         processor: Any = None,
     ):
         self.policy_generation = policy_generation
@@ -130,6 +133,10 @@ class AsyncTrajectoryCollector:
         # Track which target weights are currently being generated (globally)
         self._generating_targets: set[int] = set()
         self._next_nemo_gym_task_index = next_nemo_gym_task_index
+        self._epochs_completed = epochs_completed
+        # Keep the dataloader cursor and the collector counters that describe
+        # that cursor in one checkpoint-consistent state transition.
+        self._checkpoint_state_lock: _threading.RLock = _threading.RLock()
 
         # Timer for efficiency metrics
         self._efficiency_timer = ThreadSafeTimer(context={"worker": "collector"})
@@ -284,14 +291,22 @@ class AsyncTrajectoryCollector:
 
     def _collection_loop(self):
         """Run the collection loop in background thread."""
-        dataloader_exhausted = False
         if self.dataloader is None:
             raise RuntimeError(
                 "start_collection must set a dataloader before collection"
             )
         dataloader = self.dataloader
+        completed_all_epochs = False
         try:
-            for batch in dataloader:
+            max_num_epochs = self.master_config.grpo.max_num_epochs
+            if max_num_epochs > 0 and self._epochs_completed >= max_num_epochs:
+                completed_all_epochs = True
+                print(
+                    "🏁 Trajectory collection checkpoint already completed all "
+                    f"{max_num_epochs} configured epochs"
+                )
+            data_iter = iter(dataloader) if not completed_all_epochs else None
+            while self.running and not completed_all_epochs:
                 if not self.running:
                     break
 
@@ -337,10 +352,33 @@ class AsyncTrajectoryCollector:
                 if not self.running:
                     break
 
-                self._process_batch(batch)
-            else:
-                # for-loop completed without break → dataloader iterator exhausted
-                dataloader_exhausted = True
+                with self._checkpoint_state_lock:
+                    assert data_iter is not None
+                    try:
+                        batch = next(data_iter)
+                    except StopIteration:
+                        self._epochs_completed += 1
+                        if (
+                            max_num_epochs > 0
+                            and self._epochs_completed >= max_num_epochs
+                        ):
+                            completed_all_epochs = True
+                            print(
+                                "🏁 Trajectory collection finished all "
+                                f"{max_num_epochs} configured epochs"
+                            )
+                            break
+                        next_epoch = self._epochs_completed + 1
+                        print(
+                            f"🔁 Dataset pass {self._epochs_completed} complete; "
+                            f"starting epoch {next_epoch}"
+                        )
+                        data_iter = iter(dataloader)
+                        continue
+
+                    if not self.running:
+                        break
+                    self._process_batch(batch)
 
         except Exception as e:
             print(f"❌ Error in trajectory collection: {e}")
@@ -349,16 +387,21 @@ class AsyncTrajectoryCollector:
             traceback.print_exc()
             self.collection_failed = True
         finally:
-            self.running = False
-            if dataloader_exhausted:
+            # Keep ``running`` true while the final epoch's prompt-group workers
+            # drain. Their buffer enqueue loop uses this flag, so clearing it
+            # first silently drops the tail of the dataset.
+            if completed_all_epochs and self._inflight_threads:
+                print("⏳ Waiting for final in-flight trajectory groups to complete...")
+                self.wait_for_pending_generations()
+            if completed_all_epochs and not self.collection_failed:
                 self.data_exhausted = True
                 print(
-                    "❌ Trajectory collection stopped: dataloader exhausted "
-                    "(max_num_epochs reached). No more data available for generation. "
-                    "Increase max_num_epochs or use a larger dataset."
+                    "🏁 Trajectory collection exhausted the configured dataset "
+                    f"after {self._epochs_completed} epochs"
                 )
             else:
                 print("🛑 Trajectory collection stopped")
+            self.running = False
 
     def _stamp_nemo_gym_task_indices(self, batch: BatchedDataDict[DatumSpec]) -> None:
         """Assign one stable, monotonic task index to every prompt in a batch."""
@@ -568,7 +611,10 @@ class AsyncTrajectoryCollector:
         async_grpo_config = self.master_config.grpo.async_grpo
         in_flight_weight_updates = async_grpo_config.in_flight_weight_updates
 
-        if is_async_engine and in_flight_weight_updates:
+        reset_mm_cache = backend == "vllm" and should_reset_mm_cache_after_refit(
+            generation_cfg
+        )
+        if is_async_engine and in_flight_weight_updates and not reset_mm_cache:
             # async engines support in-flight weight updates
             # Ongoing generations will continue with their current KV caches
             # New generations (after weight update) will use the updated weights
@@ -579,10 +625,9 @@ class AsyncTrajectoryCollector:
                 f"   {len(self._inflight_threads)} ongoing generations will complete with current weights"
             )
         else:
-            # For non-async engines, wait for all pending generations to complete
-            print(
-                "⏸️ Non-async engine: waiting for all pending generations to complete..."
-            )
+            # Cache invalidation must not race with a request that is still
+            # consuming encoder outputs, even when in-flight refits are enabled.
+            print("⏸️ Waiting for pending generations before refit/cache reset...")
             self.wait_for_pending_generations()
 
         elapsed = time.time() - start_time
@@ -639,9 +684,10 @@ class AsyncTrajectoryCollector:
 
     def get_dataloader_state(self) -> dict:
         """Get the current dataloader state for checkpointing."""
-        if self.dataloader is not None:
-            return self.dataloader.state_dict()
-        return {}
+        with self._checkpoint_state_lock:
+            if self.dataloader is not None:
+                return self.dataloader.state_dict()
+            return {}
 
     def get_efficiency_metrics(self) -> dict[str, float]:
         """Return accumulated efficiency metrics (sum of durations per category).
@@ -664,7 +710,23 @@ class AsyncTrajectoryCollector:
 
     def get_rollouts_state(self) -> dict[str, int]:
         """Get collector-side rollout state for checkpointing."""
-        return {NEXT_NEMO_GYM_TASK_INDEX_KEY: self._next_nemo_gym_task_index}
+        with self._checkpoint_state_lock:
+            return {
+                NEXT_NEMO_GYM_TASK_INDEX_KEY: self._next_nemo_gym_task_index,
+                ASYNC_ROLLOUT_EPOCHS_COMPLETED_KEY: self._epochs_completed,
+            }
+
+    def get_checkpoint_state(self) -> tuple[dict, dict[str, int]]:
+        """Return one consistent dataloader and rollout-state snapshot."""
+        with self._checkpoint_state_lock:
+            dataloader_state = (
+                self.dataloader.state_dict() if self.dataloader is not None else {}
+            )
+            rollouts_state = {
+                NEXT_NEMO_GYM_TASK_INDEX_KEY: self._next_nemo_gym_task_index,
+                ASYNC_ROLLOUT_EPOCHS_COMPLETED_KEY: self._epochs_completed,
+            }
+            return dataloader_state, rollouts_state
 
     def _cleanup_finished_threads(self) -> None:
         with self._threads_lock:

@@ -19,6 +19,7 @@ from nemo_rl.data.interfaces import LLMMessageLogType, VLMMessageLogType
 
 NEMO_GYM_TASK_INDEX_KEY = "_ng_task_index"
 NEXT_NEMO_GYM_TASK_INDEX_KEY = "next_ng_task_index"
+ASYNC_ROLLOUT_EPOCHS_COMPLETED_KEY = "async_rollout_epochs_completed"
 
 
 @dataclass

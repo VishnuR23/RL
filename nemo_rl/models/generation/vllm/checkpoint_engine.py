@@ -18,7 +18,10 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
-from nemo_rl.models.generation.vllm.config import VllmConfig
+from nemo_rl.models.generation.vllm.config import (
+    VllmConfig,
+    should_reset_mm_cache_after_refit,
+)
 from nemo_rl.models.generation.vllm.refit_loader import (
     VllmShardedExpertRefitMixin,
 )
@@ -136,7 +139,9 @@ class VllmCheckpointEngineMixin(VllmShardedExpertRefitMixin):
         if checkpoint_engine is not None:
             checkpoint_engine.finalize()
 
-    async def _update_weights_from_checkpoint_engine_async(self) -> bool:
+    async def _update_weights_from_checkpoint_engine_async(
+        self, reset_mm_cache_after_refit: bool
+    ) -> bool:
         loaded_tensors = 0
         loaded_bytes = 0
         loaded_batches = 0
@@ -155,6 +160,9 @@ class VllmCheckpointEngineMixin(VllmShardedExpertRefitMixin):
             del weight_batch
 
         self._maybe_process_fp8_kv_cache()
+        self._clear_multimodal_caches_after_weight_update(  # pyrefly: ignore[missing-attribute]
+            reset_mm_cache_after_refit
+        )
 
         total_time = time.time() - start_time
         loaded_gib = loaded_bytes / (1024 * 1024 * 1024)
@@ -169,8 +177,14 @@ class VllmCheckpointEngineMixin(VllmShardedExpertRefitMixin):
     @wrap_with_nvtx_name(
         "vllm_internal_worker_extension/update_weights_from_checkpoint_engine"
     )
-    def update_weights_from_checkpoint_engine(self) -> bool:  # pragma: no cover
-        return asyncio.run(self._update_weights_from_checkpoint_engine_async())
+    def update_weights_from_checkpoint_engine(
+        self, reset_mm_cache_after_refit: bool
+    ) -> bool:  # pragma: no cover
+        return asyncio.run(
+            self._update_weights_from_checkpoint_engine_async(
+                reset_mm_cache_after_refit
+            )
+        )
 
 
 class VllmCheckpointEngineRpcMixin:
@@ -179,9 +193,18 @@ class VllmCheckpointEngineRpcMixin:
     def checkpoint_engine_rpc(
         self, checkpoint_method: str, method_args: tuple[Any, ...] = ()
     ) -> Any:  # pragma: no cover
+        if checkpoint_method == "update_weights_from_checkpoint_engine":
+            method_args = (
+                should_reset_mm_cache_after_refit(
+                    self.cfg  # pyrefly: ignore[missing-attribute]
+                ),
+            )
         result = self.llm.collective_rpc(checkpoint_method, args=method_args)
         if checkpoint_method == "update_weights_from_checkpoint_engine":
-            return all(item for item in result if item is not None)
+            succeeded = all(item for item in result if item is not None)
+            if succeeded:
+                self._invalidate_mm_cache_after_refit()  # pyrefly: ignore[missing-attribute]
+            return succeeded
         return result
 
 
@@ -195,8 +218,19 @@ class VllmAsyncCheckpointEngineRpcMixin:
             resolve_collective_rpc_result,
         )
 
+        if checkpoint_method == "update_weights_from_checkpoint_engine":
+            method_args = (
+                should_reset_mm_cache_after_refit(
+                    self.cfg  # pyrefly: ignore[missing-attribute]
+                ),
+            )
         result = await self.llm.collective_rpc(checkpoint_method, args=method_args)
         result = await resolve_collective_rpc_result(result)
         if checkpoint_method == "update_weights_from_checkpoint_engine":
-            return all(item for item in result if item is not None)
+            succeeded = all(item for item in result if item is not None)
+            if succeeded:
+                await (
+                    self._invalidate_mm_cache_after_refit()
+                )  # pyrefly: ignore[missing-attribute]
+            return succeeded
         return result

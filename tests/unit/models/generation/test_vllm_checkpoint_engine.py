@@ -96,19 +96,25 @@ def test_update_weights_from_checkpoint_engine_async_loads_all_batches(monkeypat
         ("load", [name for name, _weight in batch])
     )
     worker._maybe_process_fp8_kv_cache = lambda: events.append(("fp8",))
+    worker._clear_multimodal_caches_after_weight_update = lambda reset: events.append(
+        ("reset_mm_cache", reset)
+    )
     monkeypatch.setattr(
         torch.cuda,
         "current_stream",
         lambda: SimpleNamespace(synchronize=lambda: events.append(("sync",))),
     )
 
-    assert asyncio.run(worker._update_weights_from_checkpoint_engine_async()) is True
+    assert (
+        asyncio.run(worker._update_weights_from_checkpoint_engine_async(True)) is True
+    )
     assert events == [
         ("load", ["a"]),
         ("sync",),
         ("load", ["b", "c"]),
         ("sync",),
         ("fp8",),
+        ("reset_mm_cache", True),
     ]
 
 
@@ -145,27 +151,55 @@ def test_checkpoint_engine_methods_only_exist_on_configured_extension():
 
 
 @pytest.mark.vllm
-def test_checkpoint_engine_rpc_mixins_reduce_update_results():
+@pytest.mark.parametrize("update_succeeded", [True, False])
+@pytest.mark.parametrize("reset_mm_cache_after_refit", [True, False])
+def test_checkpoint_engine_rpc_mixins_complete_successful_refits(
+    update_succeeded,
+    reset_mm_cache_after_refit,
+):
     from nemo_rl.models.generation.vllm.checkpoint_engine import (
         VllmAsyncCheckpointEngineRpcMixin,
         VllmCheckpointEngineRpcMixin,
     )
 
     sync_worker = SimpleNamespace(
-        llm=SimpleNamespace(collective_rpc=MagicMock(return_value=[True, None]))
+        cfg={"vllm_cfg": {"reset_mm_cache_after_refit": reset_mm_cache_after_refit}},
+        llm=SimpleNamespace(
+            collective_rpc=MagicMock(return_value=[update_succeeded, None])
+        ),
+        _invalidate_mm_cache_after_refit=MagicMock(),
     )
-    assert VllmCheckpointEngineRpcMixin.checkpoint_engine_rpc(
-        sync_worker, "update_weights_from_checkpoint_engine", ("arg",)
+    assert (
+        VllmCheckpointEngineRpcMixin.checkpoint_engine_rpc(
+            sync_worker, "update_weights_from_checkpoint_engine", ("arg",)
+        )
+        is update_succeeded
     )
     sync_worker.llm.collective_rpc.assert_called_once_with(
-        "update_weights_from_checkpoint_engine", args=("arg",)
+        "update_weights_from_checkpoint_engine", args=(reset_mm_cache_after_refit,)
+    )
+    assert sync_worker._invalidate_mm_cache_after_refit.call_count == int(
+        update_succeeded
     )
 
     async_worker = SimpleNamespace(
-        llm=SimpleNamespace(collective_rpc=AsyncMock(return_value=[True, None]))
+        cfg={"vllm_cfg": {"reset_mm_cache_after_refit": reset_mm_cache_after_refit}},
+        llm=SimpleNamespace(
+            collective_rpc=AsyncMock(return_value=[update_succeeded, None])
+        ),
+        _invalidate_mm_cache_after_refit=AsyncMock(),
     )
-    assert asyncio.run(
-        VllmAsyncCheckpointEngineRpcMixin.checkpoint_engine_rpc_async(
-            async_worker, "update_weights_from_checkpoint_engine"
+    assert (
+        asyncio.run(
+            VllmAsyncCheckpointEngineRpcMixin.checkpoint_engine_rpc_async(
+                async_worker, "update_weights_from_checkpoint_engine"
+            )
         )
+        is update_succeeded
+    )
+    assert async_worker._invalidate_mm_cache_after_refit.await_count == int(
+        update_succeeded
+    )
+    async_worker.llm.collective_rpc.assert_awaited_once_with(
+        "update_weights_from_checkpoint_engine", args=(reset_mm_cache_after_refit,)
     )

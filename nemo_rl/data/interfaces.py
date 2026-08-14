@@ -59,6 +59,16 @@ class TaskDataSpec:
     prompt_file: Optional[PathLike] = None
 
     system_prompt_file: Optional[PathLike] = None
+    # Optional image/video processing controls populated by multimodal recipes.
+    num_frames: Optional[int] = None
+    use_tiling: Optional[bool] = None
+    use_dynamic_resolution: Optional[bool] = None
+    max_num_tiles: Optional[int] = None
+    max_num_patches: Optional[int] = None
+    video_target_num_patches: Optional[int] = None
+    video_temporal_patch_size: Optional[int] = None
+    video_maintain_aspect_ratio: Optional[bool] = None
+    min_generation_tokens: Optional[int] = None
 
     def __post_init__(self) -> None:
         def load_prompt_file(

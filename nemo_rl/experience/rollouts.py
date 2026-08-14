@@ -55,6 +55,7 @@ from nemo_rl.environments.interfaces import (
     EnvironmentReturn,
 )
 from nemo_rl.environments.nemo_gym import DEFAULT_THINKING_TAGS
+from nemo_rl.environments.nemo_gym_video import reattach_static_multimodal_payload
 from nemo_rl.experience.interfaces import NEMO_GYM_TASK_INDEX_KEY
 from nemo_rl.experience.metric_utils import calculate_single_metric, pct
 from nemo_rl.models.generation.interfaces import (
@@ -2347,6 +2348,11 @@ async def run_async_nemo_gym_rollout(
         raise ValueError(
             "returns_entire_batch requires num_generations to equal the batch size"
         )
+    original_message_logs = input_batch.get("message_log")
+    if original_message_logs is not None and len(original_message_logs) != len(
+        nemo_gym_rows
+    ):
+        raise ValueError("NeMo-Gym message-log count must match the rollout-row count")
 
     timer = Timer()
     timer_prefix = "timing/rollout"
@@ -2411,6 +2417,10 @@ async def run_async_nemo_gym_rollout(
 
                 _tensorize_nemo_gym_result(result)
                 completed_group = accumulator.add(rowidx, result)
+                if original_message_logs is not None:
+                    reattach_static_multimodal_payload(
+                        result["message_log"], original_message_logs[rowidx]
+                    )
                 if completed_group is not None:
                     group_input_batch = input_batch.slice(
                         completed_group.group_index * num_generations,

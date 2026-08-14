@@ -132,7 +132,9 @@ The Megatron backend uses a dedicated `NemotronOmniModel` supplied by Megatron B
 
 This is the same model-owned packing boundary used by maintained Megatron VLM integrations. It differs from the historical Nemotron Omni `LLaVAModel` path, which collapsed the expanded media-token sequence before packing and expanded it again inside the model. The dedicated model removes that extra representation change and allows the integration to use Megatron Bridge and Megatron-LM from their maintained main branches.
 
-The current Megatron recipes cover Nano image-and-text GRPO. Super, video, and audio training are follow-up work and are not enabled by these recipes.
+The maintained Megatron VLM recipes cover Nano image-and-text GRPO. The NeMo
+Gym integration also supports the static, one-video-per-row workflow described
+below. Audio and mixed audio-video rows are not supported by that workflow.
 
 ### Checkpoint compatibility
 
@@ -159,3 +161,60 @@ CONFIG_PATH=examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-mmpr-4n8g
 ```
 
 The recipes keep sequence packing enabled because the model owns the packing step after multimodal embedding insertion. They also request raw generation log probabilities so that vLLM and the Megatron policy compare the same pre-processor probability values when generation constraints such as `bad_words` are active. The generation context cap prevents the processor-expanded image prompt plus generated response from exceeding the configured 8192-token context length.
+
+## NeMo Gym video GRPO
+
+Nemotron 3 Nano Omni video GRPO accepts one local video in a NeMo Gym
+Responses row. The user message uses an `input_video` part followed by
+`input_text`:
+
+```json
+{
+  "responses_create_params": {
+    "input": [{
+      "role": "user",
+      "content": [
+        {"type": "input_video", "video_url": "/absolute/path/clip.mp4"},
+        {"type": "input_text", "text": "Which option describes the clip?"}
+      ]
+    }]
+  }
+}
+```
+
+Only local paths under `policy.generation.vllm_kwargs.allowed_local_media_path`
+are accepted. Each row must contain exactly one video and no audio. MCQA rows
+must provide real top-level `options` and one uppercase `expected_answer`
+present in those options. Use
+[`prepare_video_dataset.py`](../../../../examples/nemo_gym/prepare_video_dataset.py)
+to convert and validate source JSONL. Raw videos can be decoded at runtime, or
+the same converter workflow can use precomputed lossless frame manifests to
+avoid repeated decoding.
+
+Policy and rollout preprocessing must use the same sampling contract. The
+provided recipes use TorchCodec, Nemotron temporal sampling, 32 frames, and a
+temporal patch size of 2. The runtime therefore needs TorchCodec and its FFmpeg
+dependencies, plus these environment values on the driver and vLLM workers:
+
+```bash
+export NRL_VIDEO_BACKEND=torchcodec
+export NRL_VIDEO_SAMPLING_STYLE=nemotron_vl
+export NRL_VIDEO_TEMPORAL_PATCH_SIZE=2
+export VLLM_VIDEO_LOADER_BACKEND=nemotron_vl
+```
+
+The synchronous and asynchronous overlays are:
+
+- [`grpo_nemotron_omni_30ba3b_video_sync.yaml`](../../../../examples/nemo_gym/grpo_nemotron_omni_30ba3b_video_sync.yaml)
+- [`grpo_nemotron_omni_30ba3b_video_async.yaml`](../../../../examples/nemo_gym/grpo_nemotron_omni_30ba3b_video_async.yaml)
+
+They require the corresponding Nemotron Omni support in Megatron Bridge and
+video request/token propagation in NeMo Gym. Rollout preprocessing is patched
+at runtime against stock vLLM 0.25.1; a custom vLLM fork is not required.
+
+Both overlays set `grpo.max_num_steps: -1`, so training ends through the
+configured dataset epochs rather than an artificial step cap. They also leave
+`grpo.seq_logprob_error_threshold: null`: logged token multiplicative
+probability error (TMPE) is raw and no high-error sequence is masked. Interpret
+TMPE together with reward, loss, sequence length, and refit metrics; isolated
+maxima are less informative than a sustained shift in the distribution.
